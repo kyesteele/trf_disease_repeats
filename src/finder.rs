@@ -1,158 +1,180 @@
-use crate::alignment;
 use indicatif::{ProgressBar, ProgressStyle};
-use rayon::prelude::*;
-use std::cmp;
-use std::sync::{Arc, Mutex};
 
-#[derive(Eq, PartialEq, Hash, Clone, Debug)]
+// structure of tandem repeat
+#[derive(Clone, Debug)]
 pub struct Repeat {
-    pub motif: String,
-    pub position: usize,
-    pub length: usize,
-    pub copies: usize,
+    pub start: usize,
+    pub end: usize,
+    pub period_size: usize,
+    pub copy_number: f32,
     pub score: i32,
+    pub a_percent: f32,
+    pub c_percent: f32,
+    pub g_percent: f32,
+    pub t_percent: f32,
+    pub sequence: String,
 }
 
-/// Find the smallest repeating unit of a motif
-fn smallest_motif(motif: &str) -> &str {
-    for len in 1..=motif.len() {
-        if motif.len() % len != 0 {
-            continue;
-        }
-        let candidate = &motif[0..len];
-        if candidate.repeat(motif.len() / len) == motif {
-            return candidate;
-        }
-    }
-    motif
-}
+// for percentages of each base appearance
+#[inline]
+fn calc_composition(seq: &[u8]) -> (f32, f32, f32, f32) {
+    let mut a = 0u32;
+    let mut c = 0u32;
+    let mut g = 0u32;
+    let mut t = 0u32;
 
-/// Filter repeats: remove invalid ones and contained repeats
-fn filter_repeats(repeats: Vec<Repeat>) -> Vec<Repeat> {
-    let mut repeats_vec = repeats;
-    repeats_vec.sort_by(|a, b| {
-        a.position
-            .cmp(&b.position)
-            .then(b.score.cmp(&a.score))
-            .then(b.length.cmp(&a.length))
-    });
-
-    let mut filtered: Vec<Repeat> = Vec::new();
-    for repeat in repeats_vec {
-        if repeat.copies >= 2
-            && repeat.length >= 2 * repeat.motif.len()
-            && repeat.length % repeat.motif.len() == 0
-        {
-            let minimal_motif = smallest_motif(&repeat.motif).to_owned();
-            let length = repeat.length - (repeat.length % minimal_motif.len());
-            filtered.push(Repeat {
-                motif: minimal_motif,
-                position: repeat.position,
-                length,
-                copies: length / repeat.motif.len(),
-                score: repeat.score,
-            });
+    for &base in seq {
+        match base.to_ascii_uppercase() {
+            b'A' => a += 1,
+            b'C' => c += 1,
+            b'G' => g += 1,
+            b'T' => t += 1,
+            _ => {}
         }
     }
 
-    // Sweep-line: remove contained repeats
-    let mut final_repeats: Vec<Repeat> = Vec::new();
-    let mut last_end = 0;
-    for candidate in filtered {
-        let candidate_end = candidate.position + candidate.length;
-        if candidate.position >= last_end {
-            last_end = candidate_end;
-            final_repeats.push(candidate);
-        }
+    let total = (a + c + g + t) as f32;
+    if total == 0.0 {
+        return (0.0, 0.0, 0.0, 0.0);
     }
-    final_repeats
+
+    (
+        (a as f32 / total) * 100.0,
+        (c as f32 / total) * 100.0,
+        (g as f32 / total) * 100.0,
+        (t as f32 / total) * 100.0,
+    )
 }
 
-/// Scan a sequence for repeats in parallel with progress bar
-pub fn scan_sequence(
-    sequence: &str,
-    max_length: usize,
-    threshold: i32,
-    pb: &ProgressBar,
-) -> Vec<Repeat> {
-    let seq_bytes = sequence.as_bytes();
-    let chunk_size = 10_000;
-    let global_repeats = Arc::new(Mutex::new(Vec::new()));
-    let pb = Arc::new(pb.clone());
+// check if repeat exists at given position
+fn detect_repeat_at_position(
+    seq: &[u8],
+    start: usize,
+    period: usize,
+    match_weight: i32,
+    mismatch_penalty: i32,
+    min_score: i32,
+) -> Option<Repeat> {
+    if start + period * 2 > seq.len() {
+        return None;
+    }
 
-    let positions: Vec<(usize, usize)> = (0..seq_bytes.len())
-        .step_by(chunk_size)
-        .map(|start| (start, cmp::min(start + chunk_size, seq_bytes.len())))
-        .collect();
+    let pattern = &seq[start..start + period];
+    let mut end = start + period;
+    let mut num_copies = 1;
 
-    positions.into_par_iter().for_each(|(start, end)| {
-        let mut chunk_repeats = Vec::new();
+    let min_match_score = (period as i32 * match_weight * 2) / 3;
 
-        for i in start..end {
-            for len in 1..=max_length {
-                if i + len > seq_bytes.len() {
-                    break;
-                }
-                let motif = &seq_bytes[i..i + len];
-                let mut j = i;
-                let mut copies = 0;
-                let mut max_score = 0;
+    while end + period <= seq.len() {
+        let next_copy = &seq[end..end + period];
 
-                while j + len <= seq_bytes.len() {
-                    let window = &seq_bytes[j..j + len];
-                    let score = alignment::align(motif, window);
-                    if score >= threshold {
-                        copies += 1;
-                        max_score = cmp::max(score, max_score);
-                        j += len;
-                    } else {
-                        break;
-                    }
-                }
-
-                if copies >= 2 {
-                    chunk_repeats.push(Repeat {
-                        motif: String::from_utf8_lossy(motif).to_string(),
-                        position: i,
-                        length: copies * len,
-                        copies,
-                        score: max_score,
-                    });
-                }
+        // Quick match count
+        let mut matches = 0;
+        for i in 0..period {
+            if pattern[i] == next_copy[i] {
+                matches += 1;
             }
         }
 
-        let filtered_chunk = filter_repeats(chunk_repeats);
-        let mut global = global_repeats.lock().unwrap();
-        global.extend(filtered_chunk);
-        pb.inc((end - start) as u64);
-    });
+        let score =
+            (matches as i32 * match_weight) - ((period - matches) as i32 * mismatch_penalty);
 
-    pb.finish_with_message("Chunks scanned. Performing final sweep-line filtering...");
-
-    // Final sweep-line filter
-    let mut repeats = {
-        let mut locked = global_repeats.lock().unwrap();
-        locked.drain(..).collect::<Vec<_>>()
-    };
-
-    repeats.sort_by(|a, b| a.position.cmp(&b.position).then(b.score.cmp(&a.score)));
-
-    let mut final_repeats: Vec<Repeat> = Vec::new();
-    let mut last_end = 0;
-    for repeat in repeats {
-        let candidate_end = repeat.position + repeat.length;
-        if repeat.position >= last_end {
-            last_end = candidate_end;
-            final_repeats.push(repeat);
+        if score < min_match_score {
+            break;
         }
+
+        num_copies += 1;
+        end += period;
     }
 
-    final_repeats
+    if num_copies < 2 {
+        return None;
+    }
+
+    let total_score = num_copies as i32 * period as i32 * match_weight / 2;
+
+    if total_score < min_score {
+        return None;
+    }
+
+    let repeat_seq = &seq[start..end];
+    let (a, c, g, t) = calc_composition(repeat_seq);
+
+    Some(Repeat {
+        start: start + 1, // 1-indexed
+        end,
+        period_size: period,
+        copy_number: num_copies as f32,
+        score: total_score,
+        a_percent: a,
+        c_percent: c,
+        g_percent: g,
+        t_percent: t,
+        sequence: String::from_utf8_lossy(repeat_seq).to_string(),
+    })
 }
 
-/// Minimal summary: number of repeats, max repeat length, and repeat density
-pub fn print_repeat_summary(gene_name: &str, sequence: &str, max_length: usize, threshold: i32) {
+// scan entire sequence for repeats
+pub fn scan_sequence_trf(
+    sequence: &str,
+    match_weight: i32,
+    mismatch_penalty: i32,
+    _indel_penalty: i32,
+    min_score: i32,
+    max_period: usize,
+    pb: &ProgressBar,
+) -> Vec<Repeat> {
+    let seq_bytes = sequence.as_bytes();
+    let seq_len = seq_bytes.len();
+    let mut repeats = Vec::new();
+
+    // update in chunks
+    let chunk_size = 10000.max(seq_len / 100);
+    let mut i = 0;
+
+    while i < seq_len {
+        let chunk_end = (i + chunk_size).min(seq_len);
+
+        while i < chunk_end {
+            let mut best_repeat: Option<Repeat> = None;
+
+            // try different period sizes, but prioritize smaller ones
+            for period in 1..=max_period.min(seq_len - i).min(2000) {
+                if i + period * 2 > seq_len {
+                    break;
+                }
+
+                if let Some(repeat) = detect_repeat_at_position(
+                    seq_bytes,
+                    i,
+                    period,
+                    match_weight,
+                    mismatch_penalty,
+                    min_score,
+                ) {
+                    if best_repeat.is_none() || repeat.score > best_repeat.as_ref().unwrap().score {
+                        best_repeat = Some(repeat);
+                    }
+                }
+            }
+
+            if let Some(repeat) = best_repeat {
+                i = repeat.end;
+                repeats.push(repeat);
+            } else {
+                i += 1;
+            }
+        }
+
+        pb.set_position(i as u64);
+    }
+
+    pb.finish_with_message("Sequence scanned.");
+    repeats
+}
+
+// print results in a table with summary
+pub fn print_trf_output(sequence: &str, params: TrfParams) {
     let pb = ProgressBar::new(sequence.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -163,18 +185,80 @@ pub fn print_repeat_summary(gene_name: &str, sequence: &str, max_length: usize, 
             .progress_chars("#>-"),
     );
 
-    let repeats = scan_sequence(sequence, max_length, threshold, &pb);
+    let repeats = scan_sequence_trf(
+        sequence,
+        params.match_weight,
+        params.mismatch_penalty,
+        params.indel_penalty,
+        params.min_score,
+        params.max_period,
+        &pb,
+    );
 
-    let num_repeats = repeats.len();
-    let max_repeat_length = repeats.iter().map(|r| r.length).max().unwrap_or(0);
-    let repeat_density = if sequence.len() > 0 {
-        repeats.iter().map(|r| r.length).sum::<usize>() as f64 / sequence.len() as f64
-    } else {
-        0.0
-    };
+    println!(
+        "Parameters: {} {} {} {} {} ",
+        params.match_weight,
+        params.mismatch_penalty,
+        params.indel_penalty,
+        params.min_score,
+        params.max_period
+    );
+    println!();
 
-    println!("Gene: {}", gene_name);
-    println!("Number of repeats: {}", num_repeats);
-    println!("Maximum repeat length: {}", max_repeat_length);
-    println!("Repeat density: {:.4}", repeat_density);
+    if repeats.is_empty() {
+        println!("No tandem repeats found.");
+        return;
+    }
+
+    println!("Indices\tPeriod\tCopies\tConsensus\tMatches\tIndels\tScore\tA%\tC%\tG%\tT%\tEntropy\tConsensus\tSequence");
+
+    for r in &repeats {
+        println!(
+            "{}-{}\t{}\t{:.1}\t{}\t{:.0}\t{:.0}\t{:.0}\t{:.0}\t{}",
+            r.start,
+            r.end,
+            r.period_size,
+            r.copy_number,
+            r.score,
+            r.a_percent,
+            r.c_percent,
+            r.g_percent,
+            r.t_percent,
+            if r.sequence.len() > 50 {
+                &r.sequence[..50]
+            } else {
+                &r.sequence
+            }
+        );
+    }
+
+    println!("\n== Summary ==");
+    println!("Total repeats found: {}", repeats.len());
+
+    let total_bases: usize = repeats.iter().map(|r| r.end - r.start + 1).sum();
+    println!("Total bases in repeats: {}", total_bases);
+    println!(
+        "Percentage of sequence in repeats: {:.2}%",
+        (total_bases as f32 / sequence.len() as f32) * 100.0
+    );
+}
+
+pub struct TrfParams {
+    pub match_weight: i32,
+    pub mismatch_penalty: i32,
+    pub indel_penalty: i32,
+    pub min_score: i32,
+    pub max_period: usize,
+}
+
+impl Default for TrfParams {
+    fn default() -> Self {
+        TrfParams {
+            match_weight: 2,
+            mismatch_penalty: 7,
+            indel_penalty: 7,
+            min_score: 50,
+            max_period: 500,
+        }
+    }
 }
