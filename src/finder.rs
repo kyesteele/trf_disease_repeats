@@ -1,13 +1,15 @@
+use crate::alignment::banded_smith_waterman;
 use indicatif::{ProgressBar, ProgressStyle};
+use std::cmp;
 
-// structure of tandem repeat
+/// Structure representing a detected tandem repeat
 #[derive(Clone, Debug)]
 pub struct Repeat {
-    pub start: usize,
-    pub end: usize,
+    pub start: usize, // 1-based start
+    pub end: usize,   // 0-based exclusive end
     pub period_size: usize,
-    pub copy_number: f32,
-    pub score: i32,
+    pub copy_number: f32, // normalized by sequence length
+    pub score: f32,       // normalized by sequence length
     pub a_percent: f32,
     pub c_percent: f32,
     pub g_percent: f32,
@@ -15,7 +17,36 @@ pub struct Repeat {
     pub sequence: String,
 }
 
-// for percentages of each base appearance
+/// Parameters for TRF-like scanning
+pub struct TrfParams {
+    pub match_weight: i32,
+    pub mismatch_penalty: i32,
+    pub indel_penalty: i32,
+    pub min_score: i32,
+    pub max_period: usize,
+    pub prefilter_fraction: f32,
+    pub max_copies: usize,
+    pub refine_flank: usize,
+    pub refine_band: usize,
+}
+
+impl Default for TrfParams {
+    fn default() -> Self {
+        TrfParams {
+            match_weight: 2,
+            mismatch_penalty: 7,
+            indel_penalty: 7,
+            min_score: 50,
+            max_period: 500,
+            prefilter_fraction: 0.75,
+            max_copies: 1000,
+            refine_flank: 100,
+            refine_band: 8,
+        }
+    }
+}
+
+/// Calculate base composition (percentages)
 #[inline]
 fn calc_composition(seq: &[u8]) -> (f32, f32, f32, f32) {
     let mut a = 0u32;
@@ -46,121 +77,181 @@ fn calc_composition(seq: &[u8]) -> (f32, f32, f32, f32) {
     )
 }
 
-// check if repeat exists at given position
-fn detect_repeat_at_position(
+/// Quick scoring function
+fn quick_copy_score(motif: &[u8], copy: &[u8], match_weight: i32, mismatch_penalty: i32) -> i32 {
+    let len = cmp::min(motif.len(), copy.len());
+    let mut score = 0i32;
+    for i in 0..len {
+        if motif[i] == copy[i] {
+            score += match_weight;
+        } else {
+            score -= mismatch_penalty;
+        }
+    }
+    score
+}
+
+/// Phase 1: fast scan for candidate repeats
+fn phase1_detect(
     seq: &[u8],
     start: usize,
     period: usize,
-    match_weight: i32,
-    mismatch_penalty: i32,
-    min_score: i32,
-) -> Option<Repeat> {
-    if start + period * 2 > seq.len() {
+    params: &TrfParams,
+) -> Option<(usize, usize, i32)> {
+    let seq_len = seq.len();
+    if start + period * 2 > seq_len {
         return None;
     }
 
-    let pattern = &seq[start..start + period];
+    let motif = &seq[start..start + period];
     let mut end = start + period;
-    let mut num_copies = 1;
+    let mut copies = 1usize;
+    let mut agg_score = 0i32;
 
-    let min_match_score = (period as i32 * match_weight * 2) / 3;
+    let min_exact = ((period as f32) * params.prefilter_fraction).ceil() as usize;
 
-    while end + period <= seq.len() {
+    while end + period <= seq_len && copies < params.max_copies {
         let next_copy = &seq[end..end + period];
-
-        // Quick match count
-        let mut matches = 0;
+        let mut exact = 0usize;
         for i in 0..period {
-            if pattern[i] == next_copy[i] {
-                matches += 1;
+            if motif[i] == next_copy[i] {
+                exact += 1;
             }
         }
-
-        let score =
-            (matches as i32 * match_weight) - ((period - matches) as i32 * mismatch_penalty);
-
-        if score < min_match_score {
+        if exact < min_exact {
             break;
         }
 
-        num_copies += 1;
+        let sc = quick_copy_score(
+            motif,
+            next_copy,
+            params.match_weight,
+            params.mismatch_penalty,
+        );
+        if sc < -params.mismatch_penalty * (period as i32 / 4) {
+            break;
+        }
+
+        agg_score = agg_score.saturating_add(sc);
+        copies += 1;
         end += period;
     }
 
-    if num_copies < 2 {
+    if copies < 2 {
         return None;
     }
 
-    let total_score = num_copies as i32 * period as i32 * match_weight / 2;
-
-    if total_score < min_score {
+    let total_score = (copies as i32) * (period as i32) * params.match_weight / 2 + agg_score / 2;
+    if total_score < params.min_score {
         return None;
     }
 
-    let repeat_seq = &seq[start..end];
+    Some((end, copies, total_score))
+}
+
+/// Refine a rough repeat and normalize by sequence length
+fn refine_repeat(
+    seq: &[u8],
+    rough_start: usize,
+    rough_end: usize,
+    period: usize,
+    copies: usize,
+    rough_score: i32,
+    params: &TrfParams,
+) -> Repeat {
+    let seq_len = seq.len();
+    let flank = params.refine_flank;
+    let win_start = rough_start.saturating_sub(flank);
+    let win_end = cmp::min(seq_len, rough_end + flank);
+    let window = &seq[win_start..win_end];
+
+    let motif = &seq[rough_start..rough_start + period];
+    let repeat_times = cmp::min(copies, 50);
+    let mut pattern_repeated = Vec::with_capacity(period * repeat_times);
+    for _ in 0..repeat_times {
+        pattern_repeated.extend_from_slice(motif);
+    }
+
+    let (best_score, rel_start, rel_end) = banded_smith_waterman(
+        window,
+        &pattern_repeated,
+        params.match_weight,
+        params.mismatch_penalty,
+        params.indel_penalty,
+        params.refine_band,
+    );
+
+    let abs_start = win_start.saturating_add(rel_start);
+    let abs_end = win_start.saturating_add(rel_end).saturating_add(1);
+
+    let final_start = cmp::max(rough_start, abs_start);
+    let final_end = cmp::min(seq_len, cmp::max(rough_end, abs_end));
+
+    let repeat_seq = &seq[final_start..final_end];
     let (a, c, g, t) = calc_composition(repeat_seq);
 
-    Some(Repeat {
-        start: start + 1, // 1-indexed
-        end,
+    let copy_number = ((final_end - final_start) as f32 / period as f32) / seq_len as f32;
+    let combined_score = (rough_score.saturating_add(best_score / 2)) as f32 / seq_len as f32;
+
+    Repeat {
+        start: final_start + 1,
+        end: final_end,
         period_size: period,
-        copy_number: num_copies as f32,
-        score: total_score,
+        copy_number,
+        score: combined_score,
         a_percent: a,
         c_percent: c,
         g_percent: g,
         t_percent: t,
         sequence: String::from_utf8_lossy(repeat_seq).to_string(),
-    })
+    }
 }
 
-// scan entire sequence for repeats
-pub fn scan_sequence_trf(
-    sequence: &str,
-    match_weight: i32,
-    mismatch_penalty: i32,
-    _indel_penalty: i32,
-    min_score: i32,
-    max_period: usize,
-    pb: &ProgressBar,
-) -> Vec<Repeat> {
+/// Scan sequence for tandem repeats
+pub fn scan_sequence_trf(sequence: &str, params: &TrfParams, pb: &ProgressBar) -> Vec<Repeat> {
     let seq_bytes = sequence.as_bytes();
     let seq_len = seq_bytes.len();
     let mut repeats = Vec::new();
-
-    // update in chunks
+    let mut last_repeat_end = 0usize;
     let chunk_size = 10000.max(seq_len / 100);
-    let mut i = 0;
+    let mut i = 0usize;
 
     while i < seq_len {
         let chunk_end = (i + chunk_size).min(seq_len);
-
         while i < chunk_end {
-            let mut best_repeat: Option<Repeat> = None;
+            if i < last_repeat_end {
+                i += 1;
+                continue;
+            }
 
-            // try different period sizes, but prioritize smaller ones
-            for period in 1..=max_period.min(seq_len - i).min(2000) {
+            let mut best_candidate: Option<(usize, usize, i32, usize)> = None;
+            let max_period = cmp::min(params.max_period, seq_len.saturating_sub(i) / 2);
+            for period in 1..=max_period {
                 if i + period * 2 > seq_len {
                     break;
                 }
-
-                if let Some(repeat) = detect_repeat_at_position(
-                    seq_bytes,
-                    i,
-                    period,
-                    match_weight,
-                    mismatch_penalty,
-                    min_score,
-                ) {
-                    if best_repeat.is_none() || repeat.score > best_repeat.as_ref().unwrap().score {
-                        best_repeat = Some(repeat);
+                if let Some((rough_end, copies, rough_score)) =
+                    phase1_detect(seq_bytes, i, period, params)
+                {
+                    if best_candidate.is_none() || rough_score > best_candidate.as_ref().unwrap().2
+                    {
+                        best_candidate = Some((rough_end, copies, rough_score, period));
                     }
                 }
             }
 
-            if let Some(repeat) = best_repeat {
-                i = repeat.end;
-                repeats.push(repeat);
+            if let Some((rough_end, copies, rough_score, period)) = best_candidate {
+                let rep =
+                    refine_repeat(seq_bytes, i, rough_end, period, copies, rough_score, params);
+                if rep.start.saturating_sub(1) >= last_repeat_end {
+                    last_repeat_end = rep.end;
+                    repeats.push(rep);
+                    i = last_repeat_end;
+                    continue;
+                } else {
+                    i += 1;
+                    continue;
+                }
             } else {
                 i += 1;
             }
@@ -173,8 +264,14 @@ pub fn scan_sequence_trf(
     repeats
 }
 
-// print results in a table with summary
-pub fn print_trf_output(sequence: &str, params: TrfParams) {
+/// Summary struct
+pub struct TrfSummary {
+    pub num_repeats: usize,
+    pub percent_repeats: f64,
+}
+
+/// Collect summary normalized by sequence length
+pub fn collect_trf_summary(sequence: &str, params: TrfParams) -> TrfSummary {
     let pb = ProgressBar::new(sequence.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -185,80 +282,20 @@ pub fn print_trf_output(sequence: &str, params: TrfParams) {
             .progress_chars("#>-"),
     );
 
-    let repeats = scan_sequence_trf(
-        sequence,
-        params.match_weight,
-        params.mismatch_penalty,
-        params.indel_penalty,
-        params.min_score,
-        params.max_period,
-        &pb,
-    );
+    let repeats = scan_sequence_trf(sequence, &params, &pb);
 
-    println!(
-        "Parameters: {} {} {} {} {} ",
-        params.match_weight,
-        params.mismatch_penalty,
-        params.indel_penalty,
-        params.min_score,
-        params.max_period
-    );
-    println!();
+    let total_bases: usize = repeats
+        .iter()
+        .map(|r| r.end.saturating_sub(r.start - 1))
+        .sum();
+    let percent_repeats = if sequence.len() > 0 {
+        (total_bases as f64 / sequence.len() as f64) * 100.0
+    } else {
+        0.0
+    };
 
-    if repeats.is_empty() {
-        println!("No tandem repeats found.");
-        return;
-    }
-
-    println!("Indices\tPeriod\tCopies\tConsensus\tMatches\tIndels\tScore\tA%\tC%\tG%\tT%\tEntropy\tConsensus\tSequence");
-
-    for r in &repeats {
-        println!(
-            "{}-{}\t{}\t{:.1}\t{}\t{:.0}\t{:.0}\t{:.0}\t{:.0}\t{}",
-            r.start,
-            r.end,
-            r.period_size,
-            r.copy_number,
-            r.score,
-            r.a_percent,
-            r.c_percent,
-            r.g_percent,
-            r.t_percent,
-            if r.sequence.len() > 50 {
-                &r.sequence[..50]
-            } else {
-                &r.sequence
-            }
-        );
-    }
-
-    println!("\n== Summary ==");
-    println!("Total repeats found: {}", repeats.len());
-
-    let total_bases: usize = repeats.iter().map(|r| r.end - r.start + 1).sum();
-    println!("Total bases in repeats: {}", total_bases);
-    println!(
-        "Percentage of sequence in repeats: {:.2}%",
-        (total_bases as f32 / sequence.len() as f32) * 100.0
-    );
-}
-
-pub struct TrfParams {
-    pub match_weight: i32,
-    pub mismatch_penalty: i32,
-    pub indel_penalty: i32,
-    pub min_score: i32,
-    pub max_period: usize,
-}
-
-impl Default for TrfParams {
-    fn default() -> Self {
-        TrfParams {
-            match_weight: 2,
-            mismatch_penalty: 7,
-            indel_penalty: 7,
-            min_score: 50,
-            max_period: 500,
-        }
+    TrfSummary {
+        num_repeats: repeats.len(),
+        percent_repeats,
     }
 }

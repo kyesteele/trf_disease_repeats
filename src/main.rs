@@ -6,54 +6,75 @@ use clap::Parser;
 use finder::TrfParams;
 use std::time::Instant;
 
-fn main() {
-    let start_time = Instant::now();
-    let args = Args::parse();
-
-    // read in sequence
-    let sequence = match io::read_fna(args.input.clone()) {
-        Ok(sequence) => sequence,
-        Err(error) => {
-            eprintln!("Error reading file: {}", error);
-            return;
-        }
-    };
-
-    println!("Loaded sequence ({} bases)", sequence.len());
-    println!("Running TRF algorithm...\n");
-
-    let params = TrfParams {
-        match_weight: 2,
-        mismatch_penalty: 7,
-        indel_penalty: 7,
-        min_score: args.threshold,
-        max_period: args.max_period,
-    };
-
-    // run trf and print results
-    finder::print_trf_output(&sequence, params);
-    let duration = start_time.elapsed();
-    let secs = duration.as_secs();
-    println!("Execution Time: {} seconds.", secs);
-}
-
 #[derive(Parser, Debug)]
 #[command(
     name = "trf-rs",
     version = "1.0.0",
-    about = "Tandem Repeats Finder - Rust implementation",
-    long_about = "Find tandem repeats in DNA sequences using the TRF algorithm"
+    about = "Tandem Repeats Finder - Rust implementation (normalized by gene length)"
 )]
 struct Args {
-    // input gene file
     #[arg(short, long)]
     input: String,
 
-    // maximum length of repeats
     #[arg(short = 'l', long, default_value = "500")]
     max_period: usize,
 
-    // threshold (for alignment scoring)
     #[arg(short, long, default_value = "50")]
     threshold: i32,
+}
+
+fn main() {
+    let start_time = Instant::now();
+    let args = Args::parse();
+
+    let file_list = match io::read_file_list(&args.input) {
+        Ok(list) => list,
+        Err(error) => {
+            eprintln!("Error reading file list: {}", error);
+            return;
+        }
+    };
+
+    let mut summaries = Vec::new();
+
+    for file_path in file_list {
+        println!("Processing file: {}", file_path);
+
+        let sequence = match io::read_fna(file_path.clone()) {
+            Ok(seq) => seq,
+            Err(error) => {
+                eprintln!("Error reading {}: {}", file_path, error);
+                continue;
+            }
+        };
+
+        println!("Loaded sequence ({} bases)", sequence.len());
+        println!("Running TRF-like algorithm (normalized by gene length)...\n");
+
+        let params = TrfParams {
+            match_weight: 2,
+            mismatch_penalty: 7,
+            indel_penalty: 7,
+            min_score: args.threshold,
+            max_period: args.max_period,
+            ..Default::default()
+        };
+
+        let summary = finder::collect_trf_summary(&sequence, params);
+        summaries.push((file_path, summary));
+    }
+
+    println!("\n====== FINAL SUMMARY ======");
+    for (file_name, summary) in &summaries {
+        println!("File: {}", file_name);
+        println!("# Repeats: {}", summary.num_repeats);
+        println!("% Repeats of sequence: {:.4}%", summary.percent_repeats);
+        println!("------------------------");
+    }
+
+    let duration = start_time.elapsed();
+    println!(
+        "Total Execution Time: {:.2} seconds",
+        duration.as_secs_f64()
+    );
 }

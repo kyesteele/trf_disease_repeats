@@ -1,40 +1,76 @@
+// src/alignment.rs
 use std::cmp;
 
-pub fn align(motif: &[u8], window: &[u8]) -> i32 {
-    // match +2, mismatch -2, gap -7
-    let mut score_left: i32 = -7;
-    let mut score_center: i32 = 0;
-    let mut score_right: i32 = -7;
-
-    // check -1 position
-    for i in 1..motif.len() {
-        if window[i - 1] == motif[i] {
-            score_left += 2;
-        } else {
-            score_left -= 2;
-        }
+/// Banded Smith–Waterman local alignment
+///
+/// Returns (best_score, start_j, end_j) relative to window_seq
+pub fn banded_smith_waterman(
+    window_seq: &[u8],
+    pattern_repeated: &[u8],
+    match_score: i32,
+    mismatch_penalty: i32,
+    gap_penalty: i32,
+    band: usize,
+) -> (i32, usize, usize) {
+    let n = window_seq.len();
+    let m = pattern_repeated.len();
+    if n == 0 || m == 0 {
+        return (0, 0, 0);
     }
 
-    // check 0 position (gapless)
-    for i in 0..motif.len() {
-        if window[i] == motif[i] {
-            score_center += 2;
-        } else {
-            score_center -= 2;
+    let band_width = 2 * band + 1;
+    let mut dp_prev = vec![0i32; band_width];
+    let mut dp_cur = vec![0i32; band_width];
+
+    let mut best_score = 0i32;
+    let mut best_j = 0usize;
+
+    for i in 1..=m {
+        let diag_pos = ((i * n) as f64 / m as f64).round() as isize;
+        let j_min = cmp::max(1isize, diag_pos - band as isize) as usize;
+        let j_max = cmp::min(n, (diag_pos + band as isize) as usize);
+
+        dp_cur.fill(0);
+
+        for j in j_min..=j_max {
+            let band_idx = j as isize - diag_pos + band as isize;
+            if band_idx < 0 || band_idx >= band_width as isize {
+                continue;
+            }
+            let b = band_idx as usize;
+
+            let diag = dp_prev[b]
+                + if pattern_repeated[i - 1] == window_seq[j - 1] {
+                    match_score
+                } else {
+                    -mismatch_penalty
+                };
+
+            let left = if b > 0 {
+                dp_cur[b - 1] - gap_penalty
+            } else {
+                i32::MIN
+            };
+
+            let up = dp_prev[b] - gap_penalty;
+
+            let val = cmp::max(0, cmp::max(diag, cmp::max(left, up)));
+            dp_cur[b] = val;
+
+            if val > best_score {
+                best_score = val;
+                best_j = j;
+            }
         }
+
+        std::mem::swap(&mut dp_prev, &mut dp_cur);
     }
 
-    // check +1 position
-    for i in 0..(motif.len() - 1) {
-        if window[i + 1] == motif[i] {
-            score_right += 2;
-        } else {
-            score_right -= 2;
-        }
+    // approximate start position
+    let mut start_j = best_j;
+    while start_j > 0 && best_j - start_j <= band + 10 {
+        start_j -= 1;
     }
 
-    // return best score
-    let mut best_score = cmp::max(score_left, score_center);
-    best_score = cmp::max(best_score, score_right);
-    best_score
+    (best_score, start_j, best_j)
 }
