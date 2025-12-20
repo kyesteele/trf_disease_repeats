@@ -11,7 +11,7 @@ The algorithm considers start and end positions, alignment score, period length,
 There are two ways to run the algorithm on your machine. You can either download the pre-built release, or clone the repository and build it locally. Note that the second method will require you to have Rust and the necessary crates installed.
 
 ## Pre-Built Release
-Navigate to the "Releases" section and download v1.0. Keep note of the file path when you download it. Copy the filepath and paste it into the terminal, and then provide an input txt file, max period length, and threshold of your choice. Please note that the algorithm requires the input txt file to have only one sequence .fna file per line.
+Navigate to the "Releases" section on the right-hand side and download v1.0.0. Keep note of the file path when you download it. Copy the filepath and paste it into the terminal, and then provide an input txt file, max period length, and threshold of your choice. Please note that the algorithm requires the input txt file to have only one sequence .fna file per line.
 
 ### Command Format
 ```bash
