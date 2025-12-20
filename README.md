@@ -15,7 +15,6 @@ Navigate to the "Releases" section and download v1.0. Keep note of the file path
 
 ### Command Format
 ```bash
-```bash
 <path-to-release> --input <path-to-txt-input-file-list> --max-period <max-period-length> --threshold <threshold-number>
 ```
 
