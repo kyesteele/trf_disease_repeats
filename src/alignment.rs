@@ -2,7 +2,6 @@
 use std::cmp;
 
 /// Banded Smith–Waterman local alignment
-///
 /// Returns (best_score, start_j, end_j) relative to window_seq
 pub fn banded_smith_waterman(
     window_seq: &[u8],
@@ -25,6 +24,7 @@ pub fn banded_smith_waterman(
     let mut best_score = 0i32;
     let mut best_j = 0usize;
 
+    // iterate over the pattern
     for i in 1..=m {
         let diag_pos = ((i * n) as f64 / m as f64).round() as isize;
         let j_min = cmp::max(1isize, diag_pos - band as isize) as usize;
@@ -32,6 +32,7 @@ pub fn banded_smith_waterman(
 
         dp_cur.fill(0);
 
+        // iterate over positions within band
         for j in j_min..=j_max {
             let band_idx = j as isize - diag_pos + band as isize;
             if band_idx < 0 || band_idx >= band_width as isize {
@@ -39,6 +40,7 @@ pub fn banded_smith_waterman(
             }
             let b = band_idx as usize;
 
+            // diagonal (match/mismatch) score
             let diag = dp_prev[b]
                 + if pattern_repeated[i - 1] == window_seq[j - 1] {
                     match_score
@@ -46,12 +48,14 @@ pub fn banded_smith_waterman(
                     -mismatch_penalty
                 };
 
+            // insertion
             let left = if b > 0 {
                 dp_cur[b - 1] - gap_penalty
             } else {
                 i32::MIN
             };
 
+            // deletion
             let up = dp_prev[b] - gap_penalty;
 
             let val = cmp::max(0, cmp::max(diag, cmp::max(left, up)));

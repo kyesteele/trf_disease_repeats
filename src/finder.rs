@@ -5,11 +5,11 @@ use std::cmp;
 /// Structure representing a detected tandem repeat
 #[derive(Clone, Debug)]
 pub struct Repeat {
-    pub start: usize, // 1-based start
-    pub end: usize,   // 0-based exclusive end
+    pub start: usize,
+    pub end: usize,
     pub period_size: usize,
-    pub copy_number: f32, // normalized by sequence length
-    pub score: f32,       // normalized by sequence length
+    pub copy_number: f32,
+    pub score: f32,
     pub a_percent: f32,
     pub c_percent: f32,
     pub g_percent: f32,
@@ -17,7 +17,7 @@ pub struct Repeat {
     pub sequence: String,
 }
 
-/// Parameters for TRF-like scanning
+/// Parameters for TRF
 pub struct TrfParams {
     pub match_weight: i32,
     pub mismatch_penalty: i32,
@@ -110,6 +110,7 @@ fn phase1_detect(
 
     let min_exact = ((period as f32) * params.prefilter_fraction).ceil() as usize;
 
+    // extend motif while next copy is sufficiently similar
     while end + period <= seq_len && copies < params.max_copies {
         let next_copy = &seq[end..end + period];
         let mut exact = 0usize;
@@ -141,6 +142,7 @@ fn phase1_detect(
         return None;
     }
 
+    // compute total score
     let total_score = (copies as i32) * (period as i32) * params.match_weight / 2 + agg_score / 2;
     if total_score < params.min_score {
         return None;
@@ -149,7 +151,7 @@ fn phase1_detect(
     Some((end, copies, total_score))
 }
 
-/// Refine a rough repeat and normalize by sequence length
+/// Refine a rough repeat with banded alignment
 fn refine_repeat(
     seq: &[u8],
     rough_start: usize,
@@ -165,6 +167,7 @@ fn refine_repeat(
     let win_end = cmp::min(seq_len, rough_end + flank);
     let window = &seq[win_start..win_end];
 
+    // create pattern for alignment
     let motif = &seq[rough_start..rough_start + period];
     let repeat_times = cmp::min(copies, 50);
     let mut pattern_repeated = Vec::with_capacity(period * repeat_times);
@@ -172,6 +175,7 @@ fn refine_repeat(
         pattern_repeated.extend_from_slice(motif);
     }
 
+    // boundaries to use with banded SW
     let (best_score, rel_start, rel_end) = banded_smith_waterman(
         window,
         &pattern_repeated,
@@ -224,6 +228,7 @@ pub fn scan_sequence_trf(sequence: &str, params: &TrfParams, pb: &ProgressBar) -
                 continue;
             }
 
+            // find the best candidate at this position
             let mut best_candidate: Option<(usize, usize, i32, usize)> = None;
             let max_period = cmp::min(params.max_period, seq_len.saturating_sub(i) / 2);
             for period in 1..=max_period {
@@ -240,6 +245,7 @@ pub fn scan_sequence_trf(sequence: &str, params: &TrfParams, pb: &ProgressBar) -
                 }
             }
 
+            // refine and store repeat if pass
             if let Some((rough_end, copies, rough_score, period)) = best_candidate {
                 let rep =
                     refine_repeat(seq_bytes, i, rough_end, period, copies, rough_score, params);

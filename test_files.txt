@@ -1,0 +1,4 @@
+zero_repeat.fna
+long_repeat.fna
+short_repeat.fna
+many_short_repeat.fna

@@ -8,7 +8,7 @@ use std::time::Instant;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "trf-rs",
+    name = "trf_disease_repeats",
     version = "1.0.0",
     about = "Tandem Repeats Finder - Rust implementation (normalized by gene length)"
 )]
@@ -27,6 +27,7 @@ fn main() {
     let start_time = Instant::now();
     let args = Args::parse();
 
+    // read list of files to process
     let file_list = match io::read_file_list(&args.input) {
         Ok(list) => list,
         Err(error) => {
@@ -40,6 +41,7 @@ fn main() {
     for file_path in file_list {
         println!("Processing file: {}", file_path);
 
+        // load sequence from fna
         let sequence = match io::read_fna(file_path.clone()) {
             Ok(seq) => seq,
             Err(error) => {
@@ -51,6 +53,7 @@ fn main() {
         println!("Loaded sequence ({} bases)", sequence.len());
         println!("Running TRF-like algorithm (normalized by gene length)...\n");
 
+        // TRF parameters
         let params = TrfParams {
             match_weight: 2,
             mismatch_penalty: 7,
@@ -60,10 +63,12 @@ fn main() {
             ..Default::default()
         };
 
+        // run TRF and collect summary of results
         let summary = finder::collect_trf_summary(&sequence, params);
         summaries.push((file_path, summary));
     }
 
+    // output results
     println!("\n====== FINAL SUMMARY ======");
     for (file_name, summary) in &summaries {
         println!("File: {}", file_name);
